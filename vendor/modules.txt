@@ -1,23 +1,24 @@
-# github.com/gocql/gocql v1.7.0
-## explicit; go 1.13
-github.com/gocql/gocql
-github.com/gocql/gocql/internal/lru
-github.com/gocql/gocql/internal/murmur
-github.com/gocql/gocql/internal/streams
-# github.com/golang/snappy v0.0.3
+# github.com/cespare/xxhash/v2 v2.2.0
+## explicit; go 1.11
+github.com/cespare/xxhash/v2
+# github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f
 ## explicit
-github.com/golang/snappy
-# github.com/hailocab/go-hostpool v0.0.0-20160125115350-e80d13ce29ed
-## explicit
-github.com/hailocab/go-hostpool
+github.com/dgryski/go-rendezvous
 # github.com/lib/pq v1.10.9
 ## explicit; go 1.13
 github.com/lib/pq
 github.com/lib/pq/oid
 github.com/lib/pq/scram
+# github.com/redis/go-redis/v9 v9.7.3
+## explicit; go 1.18
+github.com/redis/go-redis/v9
+github.com/redis/go-redis/v9/internal
+github.com/redis/go-redis/v9/internal/hashtag
+github.com/redis/go-redis/v9/internal/hscan
+github.com/redis/go-redis/v9/internal/pool
+github.com/redis/go-redis/v9/internal/proto
+github.com/redis/go-redis/v9/internal/rand
+github.com/redis/go-redis/v9/internal/util
 # github.com/streadway/amqp v1.1.0
 ## explicit; go 1.10
 github.com/streadway/amqp
-# gopkg.in/inf.v0 v0.9.1
-## explicit
-gopkg.in/inf.v0

@@ -1,151 +1,161 @@
 package rabbitmq
 
 import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/streadway/amqp"
 )
 
 type Consumer struct {
-	conn    *amqp.Connection
-	Channel *amqp.Channel
-	Done    chan error
-	tag     string
-	queue   string // Добавляем поле для хранения имени очереди
+	conn        *amqp.Connection
+	channel     *amqp.Channel
+	Done        chan error
+	db          *sql.DB
+	redisClient *redis.Client
 }
 
-func NewConsumer(amqpURI string) (*Consumer, error) {
-	c := &Consumer{
-		conn:    nil,
-		Channel: nil,
-		Done:    make(chan error),
-		tag:     generateConsumerTag(),
-	}
-
-	var err error
-	c.conn, err = ConnectWithRetry(amqpURI, 10, 3*time.Second)
+func NewConsumer(amqpURI string, db *sql.DB) (*Consumer, error) {
+	conn, err := ConnectWithRetry(amqpURI, 10, 3*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	c.Channel, err = c.conn.Channel()
+	channel, err := conn.Channel()
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
 
-	return c, nil
+	redisClient, err := connectToRedis()
+	if err != nil {
+		channel.Close()
+		conn.Close()
+		return nil, err
+	}
+
+	return &Consumer{
+		conn:        conn,
+		channel:     channel,
+		Done:        make(chan error),
+		db:          db,
+		redisClient: redisClient,
+	}, nil
 }
 
-func generateConsumerTag() string {
-	rand.Seed(time.Now().UnixNano())
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	b := make([]byte, 10)
-	for i := range b {
-		b[i] = letters[rand.Intn(len(letters))]
-	}
-	return string(b)
+func generateMessageID(body []byte) string {
+	h := sha256.New()
+	h.Write(body)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func (c *Consumer) StartConsuming(
 	exchangeName string,
 	queueName string,
 	consumerName string,
-	handler func([]byte) error,
 ) error {
-	// Сначала объявляем exchange
-	err := c.Channel.ExchangeDeclare(
-		exchangeName,
-		"fanout",
-		true,  // durable
-		false, // auto-deleted
-		false, // internal
-		false, // no-wait
-		nil,   // arguments
-	)
-	if err != nil {
+	queueCfg := QueueConfig{
+		Name:       queueName,
+		Durable:    true,
+		AutoDelete: false,
+		Exclusive:  false,
+		NoWait:     false,
+		Args:       nil,
+	}
+	if err := DeclareAndBindQueue(c.channel, queueCfg, exchangeName, ""); err != nil {
 		return err
 	}
 
-	// Затем объявляем очередь
-	_, err = c.Channel.QueueDeclare(
-		queueName,
-		true,  // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	if err != nil {
-		return fmt.Errorf("failed to declare queue: %v", err)
+	if err := c.channel.Qos(10, 0, false); err != nil {
+		return fmt.Errorf("qos setup failed: %v", err)
 	}
 
-	// Привязываем очередь к exchange
-	err = c.Channel.QueueBind(
+	deliveries, err := c.channel.Consume(
 		queueName,
-		"", // routing key
-		exchangeName,
+		consumerName,
+		false,
+		false,
+		false,
 		false,
 		nil,
 	)
 	if err != nil {
-		return fmt.Errorf("failed to bind queue: %v", err)
+		return fmt.Errorf("consume failed: %v", err)
 	}
 
-	err = c.Channel.Qos(
-		1,     // prefetch count
-		0,     // prefetch size
-		false, // global
-	)
-	if err != nil {
-		return fmt.Errorf("failed to set QoS: %v", err)
-	}
-
-	deliveries, err := c.Channel.Consume(
-		queueName,
-		c.tag,
-		false, // auto-ack
-		false, // exclusive
-		false, // no-local
-		false, // no-wait
-		nil,   // args
-	)
-	if err != nil {
-		return fmt.Errorf("failed to start consuming: %v", err)
-	}
-
-	go func() {
-		for d := range deliveries {
-			err := handler(d.Body)
-			if err != nil {
-				log.Printf("[%s] Error handling message: %s - message will be requeued", consumerName, err)
-				d.Nack(false, true)
-				continue
-			}
-			if err := d.Ack(false); err != nil {
-				log.Printf("[%s] Failed to acknowledge message: %v", consumerName, err)
-			}
-		}
-		log.Printf("[%s] Deliveries channel closed", consumerName)
-		c.Done <- nil
-	}()
-
-	log.Printf("[%s] Consumer started with tag: %s", consumerName, c.tag)
+	go c.handleDeliveries(deliveries, consumerName)
+	log.Printf("[%s] Consumer started", consumerName)
 	return nil
 }
 
-func (c *Consumer) Shutdown() error {
-	if c.Channel != nil {
-		// Сначала отменяем consumer
-		if c.tag != "" {
-			if err := c.Channel.Cancel(c.tag, false); err != nil {
-				log.Printf("Error canceling consumer %s: %v", c.tag, err)
-			}
+func (c *Consumer) handleDeliveries(deliveries <-chan amqp.Delivery, consumerName string) {
+	for d := range deliveries {
+		ctx := context.Background()
+		message := string(d.Body)
+		messageID := generateMessageID(d.Body)
+		redisKey := fmt.Sprintf("message:%s", messageID)
+
+		status, err := c.redisClient.HGet(ctx, redisKey, "status").Result()
+
+		if err != nil && !errors.Is(err, redis.Nil) {
+			log.Printf("[%s] Redis error: %v (Nack)", consumerName, err)
+			_ = d.Nack(false, true)
+			continue
 		}
-		// Затем закрываем канал
-		if err := c.Channel.Close(); err != nil {
+
+		if status == "processed" {
+			if err := c.SaveToDBOnly(consumerName, messageID, message); err != nil {
+				log.Printf("[%s] DB insert error: %v (Nack)", consumerName, err)
+				_ = d.Nack(false, true)
+				continue
+			}
+			log.Printf("[%s] Message already processed, saved to DB: %s", consumerName, message)
+			_ = d.Ack(false)
+			continue
+		}
+
+		if status == "processing" {
+			log.Printf("[%s] Message is being processed by another consumer: %s",
+				consumerName, message)
+			_ = d.Nack(false, true)
+			continue
+		}
+
+		if ok, err := c.redisClient.HSetNX(ctx, redisKey, "status", "processing").Result(); err != nil || !ok {
+			log.Printf("[%s] Failed to set processing status: %v (Nack)", consumerName, err)
+			_ = d.Nack(false, true)
+			continue
+		}
+
+		c.redisClient.Expire(ctx, redisKey, 24*time.Hour)
+		c.redisClient.HSet(ctx, redisKey, "consumer", consumerName)
+
+		if err := c.SaveToDBAndRedis(consumerName, messageID, message); err != nil {
+			c.redisClient.HDel(ctx, redisKey, "status")
+			log.Printf("[%s] Processing error: %v (Nack)", consumerName, err)
+			_ = d.Nack(false, true)
+			continue
+		}
+
+		log.Printf("[%s] Successfully processed message: %s", consumerName, message)
+		_ = d.Ack(false)
+	}
+}
+
+func (c *Consumer) Shutdown() error {
+	if c.redisClient != nil {
+		if err := c.redisClient.Close(); err != nil {
+			log.Printf("Error closing Redis client: %v", err)
+		}
+	}
+	if c.channel != nil {
+		if err := c.channel.Close(); err != nil {
 			log.Printf("Error closing channel: %v", err)
 		}
 	}
