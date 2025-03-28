@@ -15,10 +15,12 @@
 ```
 ### 2. Защита от дублирования
 - **Механизм блокировок:**
+```
   // Код из handleDeliveries():
   if ok, _ := c.redisClient.HSetNX(ctx, key, "status", "processing").Result(); !ok {
   // Сообщение уже обрабатывается
   }
+```
 - **Двухуровневая проверка:**
     1. Проверка Redis (статус processing/processed)
     2. Резервная проверка в PostgreSQL
